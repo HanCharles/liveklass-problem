@@ -1,0 +1,28 @@
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 25
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+notification:
+  worker:
+    enabled: false
+    poll-interval-ms: 500
+    batch-size: 20
+    lease-seconds: 5
+  recovery:
+    enabled: false
+    interval-ms: 2000
+  retry:
+    max-attempts: 3
+    backoff-seconds: [1, 2, 3]
+
+logging:
+  level:
+    com.example.notification: DEBUG
