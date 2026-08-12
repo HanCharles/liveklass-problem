@@ -620,18 +620,15 @@ Docker(Testcontainers)가 필요하다 — 테스트 실행 시 임시 PostgreSQ
 
 ## AI 활용 범위
 
-이 프로젝트는 AI 코딩 에이전트(Claude Code)의 도움을 받아 만들었다. 초기 프로젝트
-구조 설계와 반복적인 보일러플레이트 코드(엔티티, 리포지토리, DTO, 설정 파일) 생성은
-AI가 빠르게 초안을 잡아줬지만, PostgreSQL을 선택한 이유, idempotency key를 4개 필드
-조합으로 정한 기준, 상태 전이 모델, claim 트랜잭션 분리 전략, 재시도·CircuitBreaker
-정책, 테스트 케이스 구성 같은 최종 판단은 직접 검토하고 결정했다.
+이 프로젝트는 AI 도구를 활용해 구현 속도와 검토 효율을 높였다.
 
-- 생성된 코드를 그대로 두지 않고 `./gradlew test`로 직접 실행했으며, `docker compose up`
-  + `bootRun` 후 curl로 등록/조회/목록/읽음 흐름을 수동으로도 검증했다. 강제 실패 후
-  재시도 흐름은 curl로 재현할 수 없어 IDE에서 관련 테스트를 직접 실행/디버그해
-  확인했다(자세한 내용은 [검증 결과](#검증-결과) 참고).
-- 그대로 복사한 산출물이 아니라, 요구사항(특히 동시성/장애 복구 시나리오)에 맞게 구조를
-  조정하고 검증한 결과물이다.
+초기 과제 분석, 과제 선택 기준 정리, 기술 선택 방향, 구현 프롬프트 작성에는 ChatGPT의 도움을 받았다. 이후 실제 코드 작성 과정에서는 AI 코딩 에이전트인 Claude Code를 활용해 Spring Boot 프로젝트 구조 생성, 반복적인 보일러플레이트 코드 작성, 테스트 코드 초안 작성, README 초안 작성을 보조받았다.
+
+다만 생성된 결과물을 그대로 제출하지 않고, 과제 원문 기준으로 필수 요구사항 충족 여부를 직접 확인했다. PostgreSQL을 선택한 이유, idempotency key를 `recipientId + notificationType + eventId + channel` 조합으로 정한 기준, 상태 전이 모델, worker claim 트랜잭션 분리, 재시도 정책, CircuitBreaker OPEN 처리 정책, 테스트 케이스 구성은 직접 검토하고 최종 판단했다.
+
+또한 Claude Code가 생성한 결과물을 ChatGPT와 교차 검토하면서 설계상 리스크가 있는 부분을 빠르게 파악했다. 예를 들어 worker claim 결과를 candidate 목록 그대로 반환하던 부분은 `UPDATE ... RETURNING`으로 실제 `PROCESSING` 전이에 성공한 row만 반환하도록 개선했고, CircuitBreaker OPEN으로 인한 short-circuit은 일반 발송 실패와 구분해 `attemptCount`를 소모하지 않는 정책으로 조정했다.
+
+최종적으로는 `./gradlew test`를 직접 실행해 테스트 통과 여부를 확인했고, `docker compose up` + `bootRun` 후 curl로 등록/조회/목록/읽음 흐름을 수동 검증했다. 강제 실패 및 재시도 흐름은 관련 테스트를 직접 실행하고 디버그하며 확인했다. 따라서 이 제출물은 AI가 생성한 코드를 그대로 복사한 결과물이 아니라, AI를 보조 도구로 활용하되 요구사항에 맞게 직접 판단·수정·검증한 결과물이다.
 
 ## 검증 결과
 
