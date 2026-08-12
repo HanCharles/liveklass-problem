@@ -671,6 +671,10 @@ AI가 빠르게 초안을 잡아줬지만, PostgreSQL을 선택한 이유, idemp
 ### 로컬 실행 확인 (선택)
 
 - [ ] `docker compose up -d` 후 `./gradlew bootRun` 정상 기동 확인
-- [ ] curl로 등록 → 상태 조회 → 목록 조회 → 읽음 처리 → (강제 실패 후) 재시도 흐름 확인
+- [ ] curl로 등록 → 상태 조회 → 목록 조회 → 읽음 처리 흐름 확인
 - [ ] `docker exec -it notification-postgres psql -U notification -d notification` 로
       `notification`, `notification_attempt` 테이블 상태 전이 직접 확인
+- [ ] (강제 실패 → 재시도 흐름은 `MockEmailSender`가 curl로는 실패를 강제할 수 없으므로 curl
+      스모크 테스트 대상이 아니다) IDE에서 `NotificationProcessorTest`,
+      `ManualRetryServiceTest`를 직접 실행/디버그해 실패→RETRY_WAITING→FAILED, 수동
+      재시도→READY 전이를 확인
