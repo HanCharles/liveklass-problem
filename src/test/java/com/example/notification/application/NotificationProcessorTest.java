@@ -8,6 +8,7 @@ import com.example.notification.domain.NotificationAttempt;
 import com.example.notification.domain.NotificationChannel;
 import com.example.notification.domain.NotificationStatus;
 import com.example.notification.support.AbstractIntegrationTest;
+import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
@@ -115,5 +116,40 @@ class NotificationProcessorTest extends AbstractIntegrationTest {
 
         assertThat(emailReloaded.getStatus()).isEqualTo(NotificationStatus.RETRY_WAITING);
         assertThat(inAppReloaded.getStatus()).isEqualTo(NotificationStatus.SENT);
+    }
+
+    @Test
+    void processOnce_dispatchesToKakaoAlimtalkSender() {
+        Notification notification = register("user-1", "evt-kakao-branch", NotificationChannel.KAKAO_ALIMTALK);
+
+        notificationProcessor.processOnce();
+
+        Notification reloaded =
+                notificationRepository.findById(notification.getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(NotificationStatus.SENT);
+    }
+
+    @Test
+    void processOnce_circuitBreakerOpensAfterRepeatedFailures_andShortCircuitsFurtherSendCalls() {
+        // 테스트 프로파일: notification.circuit-breaker.sliding-window-size=3, minimum-number-of-calls=3,
+        // failure-rate-threshold=50. 앞 3건이 모두 실패하면 실패율 100%로 CircuitBreaker가 OPEN되어
+        // 나머지 건은 sender.send() 자체를 호출하지 않고 즉시 실패 처리(short-circuit)된다.
+        List<Notification> notifications = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            Notification n = register("user-1", "evt-cb-" + i, NotificationChannel.EMAIL);
+            mockEmailSender.alwaysFail(n.getEventId());
+            notifications.add(n);
+        }
+
+        notificationProcessor.processOnce();
+
+        assertThat(mockEmailSender.getSendAttemptCount()).isEqualTo(3);
+
+        long circuitBreakerRejectedCount = notifications.stream()
+                .map(n -> notificationRepository.findById(n.getId()).orElseThrow())
+                .filter(n -> n.getLastFailureReason() != null
+                        && n.getLastFailureReason().toLowerCase().contains("circuitbreaker"))
+                .count();
+        assertThat(circuitBreakerRejectedCount).isEqualTo(2);
     }
 }

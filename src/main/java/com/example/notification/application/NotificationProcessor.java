@@ -5,6 +5,8 @@ import com.example.notification.domain.NotificationChannel;
 import com.example.notification.infrastructure.persistence.NotificationClaimRepository;
 import com.example.notification.infrastructure.persistence.NotificationRepository;
 import com.example.notification.infrastructure.sender.NotificationSender;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
@@ -24,6 +26,11 @@ import org.springframework.stereotype.Component;
  * 2. claim된 각 알림에 대해 sender를 트랜잭션 밖에서 호출(외부 호출이 DB 트랜잭션/커넥션을 붙잡지 않도록)
  * 3. 성공/실패 결과는 {@link NotificationRetryService}가 알림 건별 별도 트랜잭션으로 반영
  *
+ * 채널별로 CircuitBreaker(resilience4j)를 하나씩 두어, 특정 채널의 외부 발송 API가 연속으로
+ * 실패하는 동안에는 그 채널의 후속 호출을 즉시 실패 처리(fail-fast)하고 헛되이 외부 API를
+ * 호출하지 않는다. CircuitBreaker가 OPEN이어서 호출이 막힌 경우도 일반 발송 실패와 동일하게
+ * {@link NotificationRetryService#recordFailure}로 넘어가 기존 재시도 정책을 그대로 따른다.
+ *
  * {@code @Scheduled}는 이 클래스를 직접 호출하지 않고
  * {@link com.example.notification.infrastructure.worker.NotificationWorker}를 통해 호출한다.
  * 테스트는 processOnce()를 직접 호출해 스케줄러 타이밍에 의존하지 않고 결정적으로 검증한다.
@@ -40,6 +47,7 @@ public class NotificationProcessor {
     private final int batchSize;
     private final int leaseSeconds;
     private final Map<NotificationChannel, NotificationSender> sendersByChannel;
+    private final Map<NotificationChannel, CircuitBreaker> circuitBreakersByChannel;
     private final String workerId = "worker-" + UUID.randomUUID();
 
     public NotificationProcessor(
@@ -48,6 +56,7 @@ public class NotificationProcessor {
             NotificationRetryService retryService,
             List<NotificationSender> senders,
             Clock clock,
+            CircuitBreakerConfig circuitBreakerConfig,
             @Value("${notification.worker.batch-size}") int batchSize,
             @Value("${notification.worker.lease-seconds}") int leaseSeconds) {
         this.claimRepository = claimRepository;
@@ -58,10 +67,24 @@ public class NotificationProcessor {
         this.leaseSeconds = leaseSeconds;
         this.sendersByChannel =
                 senders.stream().collect(Collectors.toMap(NotificationSender::channel, Function.identity()));
+        this.circuitBreakersByChannel = senders.stream()
+                .collect(Collectors.toMap(
+                        NotificationSender::channel,
+                        sender -> CircuitBreaker.of(sender.channel().name(), circuitBreakerConfig)));
     }
 
     public String workerId() {
         return workerId;
+    }
+
+    /**
+     * 채널별 CircuitBreaker를 CLOSED 상태로 되돌리고 슬라이딩 윈도우를 비운다.
+     * CircuitBreaker는 이 빈이 살아있는 동안(스프링 싱글턴) 채널별로 상태를 계속 누적하므로,
+     * 테스트 간에 한 테스트에서 연 CircuitBreaker가 다음 테스트로 새어나가지 않도록
+     * 테스트 {@code @BeforeEach}에서 호출한다.
+     */
+    public void resetCircuitBreakers() {
+        circuitBreakersByChannel.values().forEach(CircuitBreaker::reset);
     }
 
     /** 발송 가능한 알림을 한 번 claim해서 처리한다. 처리한 건수를 반환한다. */
@@ -84,13 +107,14 @@ public class NotificationProcessor {
 
         int attemptNo = notification.getAttemptCount() + 1;
         NotificationSender sender = sendersByChannel.get(notification.getChannel());
+        CircuitBreaker circuitBreaker = circuitBreakersByChannel.get(notification.getChannel());
         Instant startedAt = clock.instant();
 
         try {
             if (sender == null) {
                 throw new IllegalStateException("no sender registered for channel " + notification.getChannel());
             }
-            sender.send(notification);
+            circuitBreaker.executeRunnable(() -> sender.send(notification));
             retryService.recordSuccess(id, attemptNo, startedAt, clock.instant());
         } catch (Exception e) {
             log.warn("notification send failed. id={}, reason={}", id, e.getMessage());

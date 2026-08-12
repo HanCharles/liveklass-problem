@@ -11,12 +11,14 @@ import com.example.notification.infrastructure.persistence.NotificationAttemptRe
 import com.example.notification.infrastructure.persistence.NotificationClaimRepository;
 import com.example.notification.infrastructure.persistence.NotificationRepository;
 import com.example.notification.infrastructure.sender.MockEmailSender;
+import com.example.notification.infrastructure.sender.MockKakaoAlimtalkSender;
 import com.example.notification.infrastructure.worker.StuckNotificationRecoveryWorker;
 import java.sql.Timestamp;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.Map;
 import java.util.UUID;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -84,6 +86,9 @@ public abstract class AbstractIntegrationTest {
     protected MockEmailSender mockEmailSender;
 
     @Autowired
+    protected MockKakaoAlimtalkSender mockKakaoAlimtalkSender;
+
+    @Autowired
     protected Clock clock;
 
     @Autowired
@@ -92,6 +97,23 @@ public abstract class AbstractIntegrationTest {
     @BeforeEach
     void resetMockSenderState() {
         mockEmailSender.reset();
+        mockKakaoAlimtalkSender.reset();
+        notificationProcessor.resetCircuitBreakers();
+        notificationAttemptRepository.deleteAll();
+        notificationRepository.deleteAll();
+    }
+
+    /**
+     * 테스트가 RETRY_WAITING처럼 nextAttemptAt이 가까운 미래인 row를 남긴 채 끝나면,
+     * 그 다음에 실행되는 테스트 클래스가 (예: SchedulerWiringTest처럼 다른 설정이라
+     * 새 Spring context를 부트스트랩해야 하는 경우) 그 부트스트랩 시간 동안 실시간
+     * 스케줄러가 이 leftover row를 먼저 집어가 버릴 수 있다 — 이때 그 클래스의
+     * {@code @BeforeEach}가 아직 실행되기 전이라 레이스 컨디션(FK 위반)이 발생할 수 있으므로,
+     * 매 테스트 종료 시점에도 명시적으로 정리해 다음 컨텍스트 부트스트랩 시점에 DB가
+     * 비어있도록 보장한다.
+     */
+    @AfterEach
+    void cleanupAfterTest() {
         notificationAttemptRepository.deleteAll();
         notificationRepository.deleteAll();
     }

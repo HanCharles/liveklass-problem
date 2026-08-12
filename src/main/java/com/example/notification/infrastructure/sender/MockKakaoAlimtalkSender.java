@@ -9,43 +9,46 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 /**
- * 실제 이메일 발송 대신 로그로 대체하는 Mock sender.
+ * 카카오 알림톡(비즈메시지) 발송을 흉내내는 Mock sender.
  *
- * 과제 제약상 실제 이메일 발송은 불필요하므로 로그 출력으로 대체한다.
- * 테스트에서 결정적으로 실패/성공 시나리오를 재현할 수 있도록 eventId 기준으로
- * "N번 실패 후 성공" / "항상 실패" 동작을 설정할 수 있다.
+ * 실제 구현에서는 카카오 비즈메시지 REST API를 호출하는 클라이언트로 교체하면 되고,
+ * {@link NotificationSender} 인터페이스를 구현하는 것 외에는 {@link NotificationProcessor}를
+ * 포함한 다른 코드를 전혀 수정할 필요가 없다(채널별 sender는 스프링 컨텍스트에 등록된
+ * {@code List<NotificationSender>}에서 channel()로 자동 매핑됨).
+ *
+ * {@link MockEmailSender}와 동일하게 eventId 기준으로 "N번 실패 후 성공" / "항상 실패"를
+ * 테스트에서 결정적으로 재현할 수 있다.
  */
 @Component
-public class MockEmailSender implements NotificationSender {
+public class MockKakaoAlimtalkSender implements NotificationSender {
 
-    private static final Logger log = LoggerFactory.getLogger(MockEmailSender.class);
+    private static final Logger log = LoggerFactory.getLogger(MockKakaoAlimtalkSender.class);
 
     private final ConcurrentHashMap<String, AtomicInteger> remainingFailuresByEventId = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Boolean> alwaysFailByEventId = new ConcurrentHashMap<>();
-    private final AtomicInteger sendAttemptCount = new AtomicInteger(0);
 
     @Override
     public NotificationChannel channel() {
-        return NotificationChannel.EMAIL;
+        return NotificationChannel.KAKAO_ALIMTALK;
     }
 
     @Override
     public void send(Notification notification) {
-        sendAttemptCount.incrementAndGet();
         String eventId = notification.getEventId();
 
         if (Boolean.TRUE.equals(alwaysFailByEventId.get(eventId))) {
-            throw new NotificationSendException("mock email server error (configured always-fail) for eventId=" + eventId);
+            throw new NotificationSendException(
+                    "mock kakao alimtalk API error (configured always-fail) for eventId=" + eventId);
         }
 
         AtomicInteger remaining = remainingFailuresByEventId.get(eventId);
         if (remaining != null && remaining.get() > 0) {
             remaining.decrementAndGet();
-            throw new NotificationSendException("mock email server error (transient) for eventId=" + eventId);
+            throw new NotificationSendException("mock kakao alimtalk API error (transient) for eventId=" + eventId);
         }
 
         log.info(
-                "[MockEmailSender] EMAIL sent. recipientId={}, title={}, message={}",
+                "[MockKakaoAlimtalkSender] KAKAO_ALIMTALK sent. recipientId={}, title={}, message={}",
                 notification.getRecipientId(),
                 notification.getTitle(),
                 notification.getMessage());
@@ -56,7 +59,7 @@ public class MockEmailSender implements NotificationSender {
         remainingFailuresByEventId.put(eventId, new AtomicInteger(times));
     }
 
-    /** 지정한 eventId에 대해 항상 실패하도록 설정한다(최종 FAILED 도달 테스트용). */
+    /** 지정한 eventId에 대해 항상 실패하도록 설정한다. */
     public void alwaysFail(String eventId) {
         alwaysFailByEventId.put(eventId, Boolean.TRUE);
     }
@@ -65,11 +68,5 @@ public class MockEmailSender implements NotificationSender {
     public void reset() {
         remainingFailuresByEventId.clear();
         alwaysFailByEventId.clear();
-        sendAttemptCount.set(0);
-    }
-
-    /** CircuitBreaker가 실제로 send()까지 호출을 막았는지(short-circuit) 검증하기 위한 실제 호출 횟수. */
-    public int getSendAttemptCount() {
-        return sendAttemptCount.get();
     }
 }

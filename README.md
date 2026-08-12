@@ -5,6 +5,11 @@ IN_APP 알림을 발송하는 시스템이다. 실제 발송은 API 요청 스�
 처리하며, 실패 시 재시도하고, 동일 이벤트에 대한 중복 발송을 방지하며, 서버 재시작 및 worker
 장애 상황에서도 알림이 유실되지 않도록 설계했다.
 
+> 과제 요구사항 자체에는 없지만, 확장성과 장애 대응을 더 보여주기 위해 KAKAO_ALIMTALK
+> 채널과 CircuitBreaker를 추가로 구현했다. 관련 내용은
+> [과제 범위 밖에서 추가로 구현한 부분](#과제-범위-밖에서-추가로-구현한-부분)에
+> 정리되어 있다.
+
 ## 목차
 
 - [프로젝트 개요](#프로젝트-개요)
@@ -14,6 +19,7 @@ IN_APP 알림을 발송하는 시스템이다. 실제 발송은 API 요청 스�
 - [데이터 모델 설명](#데이터-모델-설명)
 - [요구사항 해석 및 가정](#요구사항-해석-및-가정)
 - [설계 결정과 이유](#설계-결정과-이유)
+- [과제 범위 밖에서 추가로 구현한 부분](#과제-범위-밖에서-추가로-구현한-부분)
 - [비동기 처리 구조](#비동기-처리-구조)
 - [상태 전이표](#상태-전이표)
 - [재시도 정책](#재시도-정책)
@@ -48,6 +54,7 @@ IN_APP 알림을 발송하는 시스템이다. 실제 발송은 API 요청 스�
 | Persistence | Spring Data JPA + PostgreSQL native query 일부 |
 | DB | PostgreSQL 16 |
 | Migration | Flyway |
+| Resilience | resilience4j-circuitbreaker |
 | Container | Docker Compose |
 | Test | JUnit5, AssertJ, Testcontainers(PostgreSQL), Awaitility |
 
@@ -237,7 +244,7 @@ FAILED 상태의 알림만 재시도 가능하며, 성공 시 `attemptCount=0`, 
 | notification_type | 알림 타입(enum) |
 | event_id | 참조 이벤트 ID |
 | reference_id | 참조 데이터(강의 ID 등) |
-| channel | EMAIL / IN_APP |
+| channel | EMAIL / IN_APP / KAKAO_ALIMTALK |
 | status | READY / PROCESSING / SENT / RETRY_WAITING / FAILED |
 | title / message | 등록 시점에 템플릿으로 렌더링해 저장 |
 | payload_json | 원본 payload(JSONB) |
@@ -316,6 +323,43 @@ MySQL도 InnoDB의 row-level lock과 unique constraint로 충분히 구현 가�
 과제 원문에서 실제 메시지 브로커 설치는 불필요하다고 명시되어 있어, DB 기반 Notification
 Outbox/Queue 구조로 구현했다. 운영 환경에서는 이 구조를 Kafka/SQS/RabbitMQ 등으로
 확장할 수 있다(아래 참고).
+
+## 과제 범위 밖에서 추가로 구현한 부분
+
+아래 두 가지(KAKAO_ALIMTALK 채널, CircuitBreaker)는 과제 원문의 요구사항에는 없었지만,
+기존 구조가 요구사항 이상으로 확장 가능하다는 점과 장애 대응 설계 감각을 더 보여주기
+위해 자발적으로 추가했다.
+
+### 채널 확장 구조 (KAKAO_ALIMTALK)
+
+`NotificationSender` 인터페이스(`channel()`, `send(Notification)`)를 두고
+`NotificationProcessor`가 스프링이 주입한 `List<NotificationSender>`를 채널별 Map으로
+구성해 자동 라우팅하도록 설계했다. 그 결과 새 채널(카카오 알림톡)을 추가할 때
+`NotificationChannel` enum에 값 하나를 추가하고 해당 인터페이스를 구현하는 새 sender
+빈(`MockKakaoAlimtalkSender`)만 만들면 되고, `NotificationProcessor`나 claim/재시도
+로직은 전혀 수정하지 않았다. 실제 운영에서는 `MockKakaoAlimtalkSender`를 카카오
+비즈메시지 REST API를 호출하는 구현체로 교체하기만 하면 된다.
+
+### CircuitBreaker(resilience4j) 도입 이유와 재시도 정책과의 관계
+
+처음에는 재시도 정책 자체를 resilience4j `Retry` 모듈로 구현하는 것도 검토했지만,
+적합하지 않다고 판단해 채택하지 않았다. resilience4j `Retry`는 한 번의 호출 안에서
+동기 블로킹(`Thread.sleep`) 또는 짧은 대기 후 재시도하는 것을 전제로 하는데, 이
+과제의 재시도는 최대 15분 backoff를 두고 서버 재시작·다중 인스턴스 환경에서도
+유지되어야 하며 API로 상태(`attemptCount`, `nextAttemptAt`, `FAILED`)를 조회/수동
+재시도할 수 있어야 한다. 이건 워커 스레드를 블로킹하지 않는 **영속화된 상태**가
+필요한 요구사항이라, 인메모리 라이브러리인 resilience4j `Retry`로는 표현할 수 없다.
+그래서 재시도 자체는 지금처럼 DB에 저장된 `RETRY_WAITING` + `next_attempt_at` +
+claim 폴링 구조를 그대로 유지했다.
+
+다만 "외부 발송 API가 연속으로 죽어있을 때 계속 헛되이 호출하지 않는다"는 목적에는
+resilience4j `CircuitBreaker`가 잘 맞아서, 채널별 `sender.send()` 호출 하나만 얇게
+감싸는 형태로 추가했다(`NotificationProcessor`의 `circuitBreakersByChannel`).
+CircuitBreaker가 OPEN이어서 호출이 막히면 `CallNotPermittedException`이 발생하는데,
+이는 기존 `catch (Exception e)` 블록에서 다른 발송 실패와 동일하게 처리되어
+`recordFailure` → 기존 `RetryPolicy`의 backoff/최대 횟수 로직을 그대로 탄다. 즉
+CircuitBreaker는 상태 전이 로직을 새로 만들지 않고, "이번 시도를 실제로 외부에 던질지
+말지"만 결정하는 얇은 보호막으로만 동작한다.
 
 ## 비동기 처리 구조
 
@@ -427,7 +471,7 @@ Docker(Testcontainers)가 필요하다 — 테스트 실행 시 임시 PostgreSQ
 | `domain/RetryPolicyTest`, `domain/NotificationTest` | 재시도 backoff 계산, 상태 전이 도메인 로직(단위 테스트) |
 | `application/NotificationCommandServiceTest` | 등록 성공, 동일 idempotency key 재요청 시 기존 row 반환, 채널/수신자가 다르면 별도 알림 |
 | `application/NotificationCommandConcurrencyTest` | 20개 스레드 동시 등록 시 row 1개만 생성(동시성) |
-| `application/NotificationProcessorTest` | READY→SENT, 실패 시 RETRY_WAITING(+attemptCount 증가), maxAttempts 초과 시 FAILED, nextAttemptAt 지난 것만 재처리, EMAIL/IN_APP 채널 분기 |
+| `application/NotificationProcessorTest` | READY→SENT, 실패 시 RETRY_WAITING(+attemptCount 증가), maxAttempts 초과 시 FAILED, nextAttemptAt 지난 것만 재처리, EMAIL/IN_APP/KAKAO_ALIMTALK 채널 분기, CircuitBreaker OPEN 시 short-circuit |
 | `infrastructure/worker/StuckNotificationRecoveryWorkerTest` | lease 만료된 PROCESSING → READY 복구(attemptCount 미증가), lease 유효한 건은 그대로 유지 |
 | `application/NotificationQueryServiceTest` | 목록 조회 필터(읽음/채널), 읽음 처리 반복 호출 안전성 |
 | `application/ManualRetryServiceTest` | FAILED → READY 수동 재시도, FAILED가 아닌 건 재시도 거부 |
@@ -439,8 +483,11 @@ Docker(Testcontainers)가 필요하다 — 테스트 실행 시 임시 PostgreSQ
 
 ## 미구현 / 제약사항
 
-- 실제 이메일 발송은 하지 않는다. `MockEmailSender`가 로그로 대체하며, 테스트에서
-  eventId 기준으로 "N번 실패 후 성공" / "항상 실패"를 설정할 수 있다.
+- 실제 이메일/카카오 알림톡 발송은 하지 않는다. `MockEmailSender`, `MockKakaoAlimtalkSender`가
+  로그로 대체하며, 테스트에서 eventId 기준으로 "N번 실패 후 성공" / "항상 실패"를 설정할 수
+  있다. 실제 운영에서는 각각 SMTP/이메일 발송 서비스, 카카오 비즈메시지 REST API를 호출하는
+  구현체로 교체하면 되고, `NotificationSender` 인터페이스 덕분에 다른 코드는 수정할 필요가
+  없다.
 - 실제 메시지 브로커(Kafka/RabbitMQ/SQS)는 사용하지 않았다. 대신 DB 기반 Outbox/Queue로
   구현했으며, 대규모 트래픽 환경에서는 DB polling queue보다 메시지 브로커가 더 적합할 수 있다.
 - **발송 스케줄링(특정 시각 예약 발송)은 구현하지 않았다.** 시간 관계상 우선순위 4번(선택
@@ -470,8 +517,9 @@ Docker(Testcontainers)가 필요하다 — 테스트 실행 시 임시 PostgreSQ
 ./gradlew test
 ```
 
-`./gradlew test` 실행 결과 **테스트 클래스 10개, 총 30개 테스트 전부 통과**했다(단위 테스트 9개
-+ Testcontainers 기반 통합/동시성/HTTP/스케줄러 테스트 21개). 상세 리포트는
+`./gradlew test` 실행 결과 **테스트 클래스 10개, 총 32개 테스트 전부 통과**했다(단위 테스트 9개
++ Testcontainers 기반 통합/동시성/HTTP/스케줄러 테스트 23개, KAKAO_ALIMTALK 채널 분기와
+CircuitBreaker short-circuit 검증 2건 포함). 상세 리포트는
 `build/reports/tests/test/index.html`에서 확인할 수 있다.
 
 ### 직접 확인한 시나리오
@@ -487,7 +535,10 @@ Docker(Testcontainers)가 필요하다 — 테스트 실행 시 임시 PostgreSQ
    200 OK를 반환함(오류 없음).
 7. `FAILED` 알림에 수동 재시도 API를 호출하면 `attemptCount=0`, `status=READY`로 초기화되고,
    `FAILED`가 아닌 알림에 호출하면 409 Conflict가 반환됨.
-8. EMAIL/IN_APP 채널에 따라 서로 다른 `NotificationSender` 구현체가 호출됨.
+8. EMAIL/IN_APP/KAKAO_ALIMTALK 채널에 따라 서로 다른 `NotificationSender` 구현체가 호출됨.
+9. 특정 채널에서 연속 발송 실패가 임계치를 넘으면 CircuitBreaker가 OPEN되어, 이후 호출은
+   실제로 `NotificationSender.send()`를 호출하지 않고 즉시 실패 처리(short-circuit)되며,
+   이 실패도 기존 재시도 정책(RETRY_WAITING/backoff)을 그대로 따름.
 
 <!-- 아래는 채용 지원자가 실제 로컬 실행 후 직접 채워 넣을 수 있는 자리 -->
 ### 로컬 실행 확인 (선택)
