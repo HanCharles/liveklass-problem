@@ -47,4 +47,18 @@ public class NotificationRetryService {
         attemptRepository.save(
                 NotificationAttempt.failure(notificationId, attemptNo, failureReason, startedAt, finishedAt));
     }
+
+    /**
+     * CircuitBreaker OPEN으로 인한 short-circuit을 기록한다. 실제 sender 호출이 없었으므로
+     * {@code notification_attempt}에는 남기지 않는다(그 테이블은 실제 발송 시도만 남기는
+     * 용도로 유지한다) — 대신 {@code notification.lastFailureReason}으로 사유를 남긴다.
+     */
+    @Transactional
+    public void recordCircuitOpen(UUID notificationId, String reason, Instant nextAttemptAt, Instant now) {
+        Notification notification = notificationRepository.findById(notificationId).orElse(null);
+        if (notification == null) {
+            return;
+        }
+        notification.recordCircuitOpen(reason, nextAttemptAt, now);
+    }
 }

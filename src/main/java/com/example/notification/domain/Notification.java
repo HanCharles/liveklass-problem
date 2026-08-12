@@ -180,6 +180,22 @@ public class Notification {
         }
     }
 
+    /**
+     * CircuitBreaker가 OPEN이어서 실제 발송을 시도조차 하지 못하고 short-circuit된 경우 호출한다.
+     * 외부 sender를 실제로 호출한 게 아니므로 발송 시도 실패로 보지 않는다 — attemptCount를
+     * 증가시키지 않고, retryPolicy의 최대 횟수 판단과도 무관하게 항상 RETRY_WAITING으로
+     * 되돌린다(circuit이 아직 열려있는 한 재시도 예산을 소모할 이유가 없다).
+     */
+    public void recordCircuitOpen(String reason, Instant nextAttemptAt, Instant now) {
+        this.status = NotificationStatus.RETRY_WAITING;
+        this.lastFailureReason = reason;
+        this.nextAttemptAt = nextAttemptAt;
+        this.workerId = null;
+        this.processingStartedAt = null;
+        this.leaseUntil = null;
+        this.updatedAt = now;
+    }
+
     /** 운영자 수동 재시도: FAILED -> READY, attemptCount 초기화. */
     public void retryManually(Instant now) {
         this.status = NotificationStatus.READY;

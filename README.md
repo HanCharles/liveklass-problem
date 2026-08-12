@@ -405,11 +405,29 @@ claim 폴링 구조를 그대로 유지했다.
 다만 "외부 발송 API가 연속으로 죽어있을 때 계속 헛되이 호출하지 않는다"는 목적에는
 resilience4j `CircuitBreaker`가 잘 맞아서, 채널별 `sender.send()` 호출 하나만 얇게
 감싸는 형태로 추가했다(`NotificationProcessor`의 `circuitBreakersByChannel`).
-CircuitBreaker가 OPEN이어서 호출이 막히면 `CallNotPermittedException`이 발생하는데,
-이는 기존 `catch (Exception e)` 블록에서 다른 발송 실패와 동일하게 처리되어
-`recordFailure` → 기존 `RetryPolicy`의 backoff/최대 횟수 로직을 그대로 탄다. 즉
-CircuitBreaker는 상태 전이 로직을 새로 만들지 않고, "이번 시도를 실제로 외부에 던질지
-말지"만 결정하는 얇은 보호막으로만 동작한다.
+
+**CircuitBreaker OPEN과 일반 발송 실패는 구분해서 처리한다.** 외부 sender 호출 자체가
+실패한 경우(`sender.send()`가 예외를 던진 경우)는 실제 발송 시도 실패로 보고
+`attemptCount`를 증가시키고 `notification_attempt`에 이력을 남기며 `RetryPolicy`의
+backoff/최대 횟수 로직을 그대로 탄다. 반면 CircuitBreaker가 OPEN이어서 호출 자체가
+막힌 경우(`CallNotPermittedException`)는 외부 시스템 보호를 위한 차단일 뿐 실제로
+발송을 시도한 게 아니므로 일반 발송 실패와 구분했다 — `attemptCount`를 소모하지 않고
+`RETRY_WAITING` 상태로 되돌리며, `nextAttemptAt`은 그 CircuitBreaker에 설정된
+`waitDurationInOpenState`만큼 뒤로 잡는다(circuit이 half-open으로 전환되어 다시
+시도를 허용할 무렵과 맞춘 것 — 그 전에 재시도해봐야 다시 막힐 뿐이다). `notification_attempt`
+테이블에는 남기지 않는데, 그 테이블은 "실제 발송 시도"만 남기는 용도로 두고 싶었기
+때문이다(대신 `notification.lastFailureReason`에 `"circuit breaker open for channel
+..."`로 사유를 남긴다). 코드로는 `NotificationProcessor.processSingle()`에서
+`CallNotPermittedException`을 별도 `catch` 블록으로 분리하고
+`NotificationRetryService.recordCircuitOpen()`(attemptCount 미증가)으로 보내며,
+일반 `Exception`만 기존 `recordFailure()`(attemptCount 증가)로 보낸다.
+
+이 정책의 트레이드오프도 명확히 해둔다: 이 경로는 `RetryPolicy.canRetry()`를 거치지
+않으므로, circuit이 계속 OPEN 상태로 남아있는 한(외부 시스템이 영구적으로 죽어있는
+극단적 상황) 해당 알림은 `FAILED`로 전이되지 않고 `RETRY_WAITING`을 계속 반복한다.
+이는 의도한 설계다 — "아직 한 번도 실제로 시도하지 못한 상태"를 발송 실패로 단정 짓지
+않겠다는 판단이며, 실제 운영에서는 알림 중요도나 채널별로 이 정책(예: circuit open
+상태가 일정 시간 이상 지속되면 별도로 FAILED 처리하거나 알림)을 다르게 가져갈 수 있다.
 
 ## 비동기 처리 구조
 
@@ -513,17 +531,45 @@ claim 경로를 추가하지 않고, 기존 재시도 폴링 구조를 그대로
 ## 다중 인스턴스 환경 고려
 
 여러 worker(애플리케이션 인스턴스)가 동시에 polling해도 같은 알림이 중복 처리되지 않도록
-`NotificationClaimRepository.claim()`에서 다음을 사용한다.
+`NotificationClaimRepository.claim()`은 다음과 같이 동작한다.
 
-1. `SELECT id ... FOR UPDATE SKIP LOCKED LIMIT :batchSize` — 이미 다른 인스턴스가 잠근
-   row는 건너뛰고, 잠기지 않은 row만 골라 즉시 잠근다.
-2. `UPDATE notification SET status='PROCESSING', ... WHERE id IN (:ids) AND status IN ('READY','RETRY_WAITING')`
-   — 방어적으로 상태를 한 번 더 확인한 뒤 전이시킨다.
-3. 이 두 쿼리는 하나의 짧은 트랜잭션(`REQUIRES_NEW`)으로 즉시 커밋되어, 다른 인스턴스가
-   다음 polling에서 곧바로 최신 상태를 보게 된다.
+worker는 PostgreSQL의 `FOR UPDATE SKIP LOCKED`로 이미 다른 worker가 잠근 row를 건너뛰고,
+`UPDATE ... RETURNING`을 통해 실제로 `PROCESSING` 상태로 전환된 row만 claim 결과로 사용한다.
+이를 통해 candidate 조회 결과와 실제 update 결과가 어긋나는 가능성을 줄이고, 다중 인스턴스
+환경에서 동일 알림이 중복 처리될 위험을 낮췄다.
+
+```sql
+WITH candidates AS (
+    SELECT id FROM notification
+    WHERE status IN ('READY', 'RETRY_WAITING')
+      AND next_attempt_at <= :now
+    ORDER BY created_at
+    LIMIT :batchSize
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE notification n
+SET status = 'PROCESSING', worker_id = :workerId, processing_started_at = :now,
+    lease_until = :leaseUntil, updated_at = :now
+FROM candidates c
+WHERE n.id = c.id AND n.status IN ('READY', 'RETRY_WAITING')
+RETURNING n.id
+```
+
+1. `WITH candidates AS (...)`가 이미 다른 인스턴스가 잠근 row는 `SKIP LOCKED`로 건너뛰고,
+   잠기지 않은 row만 골라 그 자리에서 즉시 잠근다.
+2. 같은 SQL 문 안에서 그 candidates를 바로 `UPDATE ... FROM candidates`로 전이시키고,
+   `n.status IN ('READY', 'RETRY_WAITING')`을 한 번 더 방어적으로 확인한다(같은 문장 내
+   CTE→UPDATE 사이에는 다른 트랜잭션이 끼어들 수 없어 이 조건은 사실상 항상 참이지만,
+   나중에 이 로직이 여러 문장으로 분리되더라도 안전하도록 명시적으로 남겨뒀다).
+3. `RETURNING n.id`로 **실제로 PROCESSING 전이에 성공한 id만** claim 결과로 반환한다 — SELECT로
+   조회한 후보 목록을 그대로 신뢰해 반환하던 이전 방식과 달리, "조회 결과 = 실제 반영 결과"를
+   SQL 자체가 보장해준다.
+4. 이 한 문장은 짧은 트랜잭션(`REQUIRES_NEW`)으로 즉시 커밋되어, 다른 인스턴스가 다음
+   polling에서 곧바로 최신 상태를 보게 된다.
 
 이 방식은 애플리케이션 레벨의 분산 락(Redis 등) 없이도 PostgreSQL의 row-level lock만으로
-다중 인스턴스 중복 처리를 방지한다.
+다중 인스턴스 중복 처리를 방지한다. `NotificationClaimRepositoryTest`에서 5개 worker가
+동시에 claim해도 같은 id가 중복 반환되지 않음을 검증한다.
 
 ## 테스트 실행 방법
 
@@ -541,7 +587,8 @@ Docker(Testcontainers)가 필요하다 — 테스트 실행 시 임시 PostgreSQ
 | `domain/RetryPolicyTest`, `domain/NotificationTest` | 재시도 backoff 계산, 상태 전이 도메인 로직(단위 테스트) |
 | `application/NotificationCommandServiceTest` | 등록 성공, 동일 idempotency key 재요청 시 기존 row 반환, 채널/수신자가 다르면 별도 알림 |
 | `application/NotificationCommandConcurrencyTest` | 20개 스레드 동시 등록 시 row 1개만 생성(동시성) |
-| `application/NotificationProcessorTest` | READY→SENT, 실패 시 RETRY_WAITING(+attemptCount 증가), maxAttempts 초과 시 FAILED, nextAttemptAt 지난 것만 재처리, EMAIL/IN_APP/KAKAO_ALIMTALK 채널 분기, CircuitBreaker OPEN 시 short-circuit, 예약 발송 건은 예약 시각 전엔 claim 안 됨/시각 도래 후 claim됨 |
+| `application/NotificationProcessorTest` | READY→SENT, 실패 시 RETRY_WAITING(+attemptCount 증가), maxAttempts 초과 시 FAILED, nextAttemptAt 지난 것만 재처리, EMAIL/IN_APP/KAKAO_ALIMTALK 채널 분기, CircuitBreaker OPEN 시 short-circuit(실제 발송 실패와 attemptCount/이력 구분), 예약 발송 건은 예약 시각 전엔 claim 안 됨/시각 도래 후 claim됨 |
+| `infrastructure/persistence/NotificationClaimRepositoryTest` | claim() 결과가 실제 PROCESSING 전이된 row와 정확히 일치, 예약/미도래 건 미claim, 5개 worker 동시 claim 시 같은 id 중복 반환 없음 |
 | `infrastructure/worker/StuckNotificationRecoveryWorkerTest` | lease 만료된 PROCESSING → READY 복구(attemptCount 미증가), lease 유효한 건은 그대로 유지 |
 | `application/NotificationQueryServiceTest` | 목록 조회 필터(읽음/채널), 읽음 처리 반복 호출 안전성 |
 | `application/NotificationReadConcurrencyTest` | 20개 스레드가 동시에 읽음 처리 요청을 보내도 readAt이 단 하나의 값으로만 수렴(lost update 없음) |
@@ -584,10 +631,11 @@ Docker(Testcontainers)가 필요하다 — 테스트 실행 시 임시 PostgreSQ
 ./gradlew test
 ```
 
-`./gradlew test` 실행 결과 **테스트 클래스 11개, 총 38개 테스트 전부 통과**했다(단위 테스트
-10개 + Testcontainers 기반 통합/동시성/HTTP/스케줄러 테스트 28개 — KAKAO_ALIMTALK 채널
-분기, CircuitBreaker short-circuit, 예약 발송 claim 지연/도래, 읽음 처리 동시성 20-스레드
-검증 포함). 상세 리포트는 `build/reports/tests/test/index.html`에서 확인할 수 있다.
+`./gradlew test` 실행 결과 **테스트 클래스 12개, 총 42개 테스트 전부 통과**했다(단위 테스트
+10개 + Testcontainers 기반 통합/동시성/HTTP/스케줄러 테스트 32개 — KAKAO_ALIMTALK 채널
+분기, CircuitBreaker short-circuit(실제 실패와의 정책 구분 포함), 예약 발송 claim 지연/도래,
+읽음 처리 동시성 20-스레드, claim() RETURNING 결과 검증 및 5-worker 동시 claim 무중복 검증
+포함). 상세 리포트는 `build/reports/tests/test/index.html`에서 확인할 수 있다.
 
 ### 직접 확인한 시나리오
 
@@ -604,14 +652,19 @@ Docker(Testcontainers)가 필요하다 — 테스트 실행 시 임시 PostgreSQ
    `FAILED`가 아닌 알림에 호출하면 409 Conflict가 반환됨.
 8. EMAIL/IN_APP/KAKAO_ALIMTALK 채널에 따라 서로 다른 `NotificationSender` 구현체가 호출됨.
 9. 특정 채널에서 연속 발송 실패가 임계치를 넘으면 CircuitBreaker가 OPEN되어, 이후 호출은
-   실제로 `NotificationSender.send()`를 호출하지 않고 즉시 실패 처리(short-circuit)되며,
-   이 실패도 기존 재시도 정책(RETRY_WAITING/backoff)을 그대로 따름.
+   실제로 `NotificationSender.send()`를 호출하지 않고 즉시 실패 처리(short-circuit)됨.
+   이때는 실제 발송 실패(attemptCount 증가, `notification_attempt` 이력 남음)와 구분되어
+   attemptCount가 증가하지 않고 이력도 남지 않으며, `RETRY_WAITING` + circuit breaker
+   관련 사유만 `lastFailureReason`에 남음.
 10. `scheduledAt`(미래 시각)을 지정해 등록하면 `READY` 상태이지만 그 시각이 지나기 전까지는
     worker가 claim하지 않고, 시각이 지난 뒤에는 정상적으로 claim되어 `SENT`까지 전이됨.
     과거 시각으로 등록을 시도하면 `400 Bad Request`.
 11. 여러 스레드(기기 흉내)가 같은 알림에 동시에 읽음 처리 요청을 보내도 `readAt`이 단 하나의
     값으로만 수렴하고, 예외 없이 모두 200 OK를 반환함(원자적 `COALESCE` UPDATE로 lost update
     방지).
+12. 여러 worker가 동시에 claim해도 같은 notification id가 두 worker에게 동시에 반환되지
+    않고, claim 결과에 포함된 id는 항상 실제로 DB에서 `PROCESSING`으로 전이된 row와 정확히
+    일치함(`UPDATE ... RETURNING`).
 
 <!-- 아래는 채용 지원자가 실제 로컬 실행 후 직접 채워 넣을 수 있는 자리 -->
 ### 로컬 실행 확인 (선택)

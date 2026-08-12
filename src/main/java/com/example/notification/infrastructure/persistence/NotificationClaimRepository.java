@@ -13,7 +13,12 @@ import org.springframework.transaction.annotation.Transactional;
  * worker가 발송 가능한 알림을 claim하는 저장소.
  *
  * PostgreSQL {@code FOR UPDATE SKIP LOCKED}로 여러 인스턴스가 동시에 같은 row를 잡지 않도록 하고,
- * 잡은 row만 상태 조건부(READY/RETRY_WAITING)로 PROCESSING 전이시킨다.
+ * {@code UPDATE ... RETURNING}으로 실제로 PROCESSING 전이에 성공한 row의 id만 claim 결과로
+ * 반환한다. candidate 조회(SELECT)와 실제 반영(UPDATE)을 하나의 SQL 문(CTE)으로 묶었기 때문에,
+ * "후보로 집었지만 실제로는 update되지 않은 row"가 claim 결과에 섞여 들어올 가능성이 구조적으로
+ * 없다 — 두 단계로 나눠 candidateIds를 그대로 반환하던 이전 방식은 로직상 안전했지만(같은
+ * 트랜잭션에서 row lock을 잡은 채 update했으므로), "조회 결과 = 실제 반영 결과"라는 보장이
+ * 코드만 봐서는 명확하지 않았다. 이 방식은 그 보장을 SQL 자체가 대신 해준다.
  *
  * READY 상태도 RETRY_WAITING과 동일하게 {@code next_attempt_at <= now} 조건을 검사한다.
  * 즉시 발송 요청은 등록 시 {@code next_attempt_at = 등록 시각}으로 저장되므로 이 조건이 항상
@@ -33,43 +38,35 @@ public class NotificationClaimRepository {
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public List<UUID> claim(String workerId, Instant now, Instant leaseUntil, int batchSize) {
         @SuppressWarnings("unchecked")
-        List<UUID> candidateIds = entityManager
+        List<UUID> claimedIds = entityManager
                 .createNativeQuery(
                         """
-                        SELECT id FROM notification
-                        WHERE status IN ('READY', 'RETRY_WAITING')
-                          AND next_attempt_at <= :now
-                        ORDER BY created_at
-                        FOR UPDATE SKIP LOCKED
-                        LIMIT :batchSize
-                        """)
-                .setParameter("now", now)
-                .setParameter("batchSize", batchSize)
-                .getResultList();
-
-        if (candidateIds.isEmpty()) {
-            return candidateIds;
-        }
-
-        entityManager
-                .createNativeQuery(
-                        """
-                        UPDATE notification
+                        WITH candidates AS (
+                            SELECT id FROM notification
+                            WHERE status IN ('READY', 'RETRY_WAITING')
+                              AND next_attempt_at <= :now
+                            ORDER BY created_at
+                            LIMIT :batchSize
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        UPDATE notification n
                         SET status = 'PROCESSING',
                             worker_id = :workerId,
                             processing_started_at = :now,
                             lease_until = :leaseUntil,
                             updated_at = :now
-                        WHERE id IN (:ids)
-                          AND status IN ('READY', 'RETRY_WAITING')
+                        FROM candidates c
+                        WHERE n.id = c.id
+                          AND n.status IN ('READY', 'RETRY_WAITING')
+                        RETURNING n.id
                         """)
-                .setParameter("workerId", workerId)
                 .setParameter("now", now)
+                .setParameter("batchSize", batchSize)
+                .setParameter("workerId", workerId)
                 .setParameter("leaseUntil", leaseUntil)
-                .setParameter("ids", candidateIds)
-                .executeUpdate();
+                .getResultList();
 
-        return candidateIds;
+        return claimedIds;
     }
 
     /**

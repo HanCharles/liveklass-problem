@@ -148,12 +148,59 @@ class NotificationProcessorTest extends AbstractIntegrationTest {
 
         assertThat(mockEmailSender.getSendAttemptCount()).isEqualTo(3);
 
-        long circuitBreakerRejectedCount = notifications.stream()
+        List<Notification> reloaded = notifications.stream()
                 .map(n -> notificationRepository.findById(n.getId()).orElseThrow())
-                .filter(n -> n.getLastFailureReason() != null
-                        && n.getLastFailureReason().toLowerCase().contains("circuitbreaker"))
-                .count();
-        assertThat(circuitBreakerRejectedCount).isEqualTo(2);
+                .toList();
+
+        // 실제로 sender.send()가 호출되어 실패한 3건: attemptCount가 증가하고 시도 이력이 남는다.
+        List<Notification> realFailures =
+                reloaded.stream().filter(n -> n.getAttemptCount() == 1).toList();
+        assertThat(realFailures).hasSize(3);
+        assertThat(realFailures).allMatch(n -> n.getStatus() == NotificationStatus.RETRY_WAITING);
+        for (Notification n : realFailures) {
+            List<NotificationAttempt> attempts =
+                    notificationAttemptRepository.findByNotificationIdOrderByAttemptNoAsc(n.getId());
+            assertThat(attempts).hasSize(1);
+            assertThat(attempts.get(0).getStatus()).isEqualTo(AttemptStatus.FAILURE);
+        }
+
+        // CircuitBreaker OPEN으로 short-circuit된 나머지 2건: attemptCount는 그대로, 시도 이력도 안 남는다.
+        List<Notification> circuitOpen =
+                reloaded.stream().filter(n -> n.getAttemptCount() == 0).toList();
+        assertThat(circuitOpen).hasSize(2);
+        assertThat(circuitOpen).allMatch(n -> n.getStatus() == NotificationStatus.RETRY_WAITING);
+        assertThat(circuitOpen)
+                .allMatch(n -> n.getLastFailureReason() != null
+                        && n.getLastFailureReason().toLowerCase().contains("circuit breaker"));
+        for (Notification n : circuitOpen) {
+            assertThat(notificationAttemptRepository.findByNotificationIdOrderByAttemptNoAsc(n.getId()))
+                    .isEmpty();
+        }
+    }
+
+    @Test
+    void processOnce_circuitBreakerOpen_doesNotIncrementAttemptCountAndKeepsRetryWaiting() {
+        // 먼저 EMAIL CircuitBreaker를 OPEN시킨다(테스트 프로파일 minimum-number-of-calls=3).
+        for (int i = 0; i < 3; i++) {
+            Notification warmup = register("user-1", "evt-cb-warmup-" + i, NotificationChannel.EMAIL);
+            mockEmailSender.alwaysFail(warmup.getEventId());
+        }
+        notificationProcessor.processOnce();
+        int sendAttemptsAfterWarmup = mockEmailSender.getSendAttemptCount();
+
+        // circuit이 OPEN인 상태에서 새 알림을 등록해 claim되게 한다.
+        Notification target = register("user-1", "evt-cb-target", NotificationChannel.EMAIL);
+
+        notificationProcessor.processOnce();
+
+        assertThat(mockEmailSender.getSendAttemptCount()).isEqualTo(sendAttemptsAfterWarmup);
+        Notification reloaded = notificationRepository.findById(target.getId()).orElseThrow();
+        assertThat(reloaded.getAttemptCount()).isZero();
+        assertThat(reloaded.getStatus()).isEqualTo(NotificationStatus.RETRY_WAITING);
+        assertThat(reloaded.getLastFailureReason()).containsIgnoringCase("circuit breaker");
+        assertThat(reloaded.getNextAttemptAt()).isAfter(clock.instant());
+        assertThat(notificationAttemptRepository.findByNotificationIdOrderByAttemptNoAsc(target.getId()))
+                .isEmpty();
     }
 
     @Test
