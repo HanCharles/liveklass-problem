@@ -12,8 +12,17 @@ IN_APP 알림을 발송하는 시스템이다. 실제 발송은 API 요청 스�
 > [과제 범위 밖에서 추가로 구현한 부분](#과제-범위-밖에서-추가로-구현한-부분)에
 > 정리되어 있다.
 
+## 핵심 구현 요약
+
+- DB 기반 Outbox/Queue 구조로 알림 요청 등록과 실제 발송 처리를 분리했다.
+- `recipientId + notificationType + eventId + channel` 기준 unique key로 동일 이벤트 중복 발송을 방지했다.
+- PostgreSQL `FOR UPDATE SKIP LOCKED`와 `UPDATE ... RETURNING`으로 실제 claim된 row만 처리해 다중 worker 환경의 중복 처리를 방어했다.
+- 실패 시 `RETRY_WAITING`, 최대 재시도 초과 시 `FAILED`로 상태를 관리하고 발송 시도 이력을 남기며, 일반 발송 실패와 CircuitBreaker OPEN으로 인한 short-circuit은 재시도 횟수 소모 여부를 구분해서 관리한다.
+- `leaseUntil`이 지난 `PROCESSING` 알림은 stuck 상태로 보고 `READY`로 복구한다.
+
 ## 목차
 
+- [핵심 구현 요약](#핵심-구현-요약)
 - [프로젝트 개요](#프로젝트-개요)
 - [기술 스택](#기술-스택)
 - [실행 방법](#실행-방법)
@@ -384,50 +393,42 @@ Outbox/Queue 구조로 구현했다. 운영 환경에서는 이 구조를 Kafka/
 
 `NotificationSender` 인터페이스(`channel()`, `send(Notification)`)를 두고
 `NotificationProcessor`가 스프링이 주입한 `List<NotificationSender>`를 채널별 Map으로
-구성해 자동 라우팅하도록 설계했다. 그 결과 새 채널(카카오 알림톡)을 추가할 때
-`NotificationChannel` enum에 값 하나를 추가하고 해당 인터페이스를 구현하는 새 sender
-빈(`MockKakaoAlimtalkSender`)만 만들면 되고, `NotificationProcessor`나 claim/재시도
-로직은 전혀 수정하지 않았다. 실제 운영에서는 `MockKakaoAlimtalkSender`를 카카오
-비즈메시지 REST API를 호출하는 구현체로 교체하기만 하면 된다.
+자동 라우팅하도록 설계했다. 새 채널을 추가할 때 `NotificationChannel` enum에 값 하나를
+추가하고 해당 인터페이스를 구현하는 새 sender 빈(`MockKakaoAlimtalkSender`)만 만들면
+되고, `NotificationProcessor`나 claim/재시도 로직은 전혀 수정하지 않았다. 실제 운영에서는
+`MockKakaoAlimtalkSender`를 카카오 비즈메시지 REST API 호출 구현체로 교체하기만 하면 된다.
 
 ### CircuitBreaker(resilience4j) 도입 이유와 재시도 정책과의 관계
 
-처음에는 재시도 정책 자체를 resilience4j `Retry` 모듈로 구현하는 것도 검토했지만,
-적합하지 않다고 판단해 채택하지 않았다. resilience4j `Retry`는 한 번의 호출 안에서
-동기 블로킹(`Thread.sleep`) 또는 짧은 대기 후 재시도하는 것을 전제로 하는데, 이
-과제의 재시도는 최대 15분 backoff를 두고 서버 재시작·다중 인스턴스 환경에서도
-유지되어야 하며 API로 상태(`attemptCount`, `nextAttemptAt`, `FAILED`)를 조회/수동
-재시도할 수 있어야 한다. 이건 워커 스레드를 블로킹하지 않는 **영속화된 상태**가
-필요한 요구사항이라, 인메모리 라이브러리인 resilience4j `Retry`로는 표현할 수 없다.
-그래서 재시도 자체는 지금처럼 DB에 저장된 `RETRY_WAITING` + `next_attempt_at` +
-claim 폴링 구조를 그대로 유지했다.
+재시도 정책 자체를 resilience4j `Retry`로 구현하는 것도 검토했지만, 이 과제의 재시도는
+최대 15분 backoff를 두고 서버 재시작·다중 인스턴스 환경에서도 유지되어야 하며 API로
+상태(`attemptCount`, `nextAttemptAt`, `FAILED`)를 조회/수동 재시도할 수 있어야 하는,
+**워커 스레드를 블로킹하지 않는 영속화된 상태**가 필요한 요구사항이다. 인메모리
+라이브러리인 resilience4j `Retry`로는 이를 표현할 수 없어 채택하지 않았고, 재시도는
+지금처럼 DB의 `RETRY_WAITING` + `next_attempt_at` + claim 폴링 구조를 그대로 유지했다.
 
 다만 "외부 발송 API가 연속으로 죽어있을 때 계속 헛되이 호출하지 않는다"는 목적에는
 resilience4j `CircuitBreaker`가 잘 맞아서, 채널별 `sender.send()` 호출 하나만 얇게
 감싸는 형태로 추가했다(`NotificationProcessor`의 `circuitBreakersByChannel`).
 
-**CircuitBreaker OPEN과 일반 발송 실패는 구분해서 처리한다.** 외부 sender 호출 자체가
-실패한 경우(`sender.send()`가 예외를 던진 경우)는 실제 발송 시도 실패로 보고
-`attemptCount`를 증가시키고 `notification_attempt`에 이력을 남기며 `RetryPolicy`의
-backoff/최대 횟수 로직을 그대로 탄다. 반면 CircuitBreaker가 OPEN이어서 호출 자체가
-막힌 경우(`CallNotPermittedException`)는 외부 시스템 보호를 위한 차단일 뿐 실제로
-발송을 시도한 게 아니므로 일반 발송 실패와 구분했다 — `attemptCount`를 소모하지 않고
-`RETRY_WAITING` 상태로 되돌리며, `nextAttemptAt`은 그 CircuitBreaker에 설정된
-`waitDurationInOpenState`만큼 뒤로 잡는다(circuit이 half-open으로 전환되어 다시
-시도를 허용할 무렵과 맞춘 것 — 그 전에 재시도해봐야 다시 막힐 뿐이다). `notification_attempt`
-테이블에는 남기지 않는데, 그 테이블은 "실제 발송 시도"만 남기는 용도로 두고 싶었기
-때문이다(대신 `notification.lastFailureReason`에 `"circuit breaker open for channel
-..."`로 사유를 남긴다). 코드로는 `NotificationProcessor.processSingle()`에서
-`CallNotPermittedException`을 별도 `catch` 블록으로 분리하고
-`NotificationRetryService.recordCircuitOpen()`(attemptCount 미증가)으로 보내며,
-일반 `Exception`만 기존 `recordFailure()`(attemptCount 증가)로 보낸다.
+**CircuitBreaker OPEN과 일반 발송 실패는 구분해서 처리한다.** `sender.send()`가 예외를
+던진 실제 발송 실패는 `attemptCount` 증가 + `notification_attempt` 이력 기록 +
+`RetryPolicy`의 backoff/최대 횟수 로직을 그대로 탄다. 반면 CircuitBreaker가 OPEN이라
+호출 자체가 막힌 경우(`CallNotPermittedException`)는 실제로 발송을 시도한 게 아니므로
+구분해서, `attemptCount`를 소모하지 않고 `RETRY_WAITING`으로 되돌리며 `nextAttemptAt`은
+그 CircuitBreaker의 `waitDurationInOpenState`만큼 뒤로 잡는다(circuit이 half-open으로
+전환될 무렵과 맞춘 것). `notification_attempt`에는 남기지 않고(실제 시도만 남기는
+용도로 유지) 대신 `lastFailureReason`에 사유를 남긴다. 코드로는
+`NotificationProcessor.processSingle()`에서 `CallNotPermittedException`을 별도
+`catch`로 분리해 `NotificationRetryService.recordCircuitOpen()`(attemptCount 미증가)으로
+보내고, 일반 `Exception`만 기존 `recordFailure()`(attemptCount 증가)로 보낸다.
 
-이 정책의 트레이드오프도 명확히 해둔다: 이 경로는 `RetryPolicy.canRetry()`를 거치지
-않으므로, circuit이 계속 OPEN 상태로 남아있는 한(외부 시스템이 영구적으로 죽어있는
-극단적 상황) 해당 알림은 `FAILED`로 전이되지 않고 `RETRY_WAITING`을 계속 반복한다.
-이는 의도한 설계다 — "아직 한 번도 실제로 시도하지 못한 상태"를 발송 실패로 단정 짓지
-않겠다는 판단이며, 실제 운영에서는 알림 중요도나 채널별로 이 정책(예: circuit open
-상태가 일정 시간 이상 지속되면 별도로 FAILED 처리하거나 알림)을 다르게 가져갈 수 있다.
+**트레이드오프**: 이 경로는 `RetryPolicy.canRetry()`를 거치지 않으므로, circuit이 계속
+OPEN 상태로 남아있는 극단적 상황(외부 시스템이 영구적으로 죽어있음)에서는 해당 알림이
+`FAILED`로 전이되지 않고 `RETRY_WAITING`을 계속 반복한다. "아직 실제로 시도하지 못한
+상태"를 발송 실패로 단정 짓지 않겠다는 의도한 설계이며, 실제 운영에서는 알림 중요도나
+채널별로 이 정책(예: circuit open이 일정 시간 이상 지속되면 별도로 FAILED 처리)을
+다르게 가져갈 수 있다.
 
 ## 비동기 처리 구조
 
@@ -469,7 +470,8 @@ backoff/최대 횟수 로직을 그대로 탄다. 반면 CircuitBreaker가 OPEN�
 |---|---|---|
 | READY | PROCESSING | worker가 claim(`FOR UPDATE SKIP LOCKED` + 조건부 UPDATE) |
 | PROCESSING | SENT | sender 발송 성공 |
-| PROCESSING | RETRY_WAITING | 발송 실패, `attemptCount < maxAttempts` |
+| PROCESSING | RETRY_WAITING | 발송 실패, `attemptCount < maxAttempts`(attemptCount 증가) |
+| PROCESSING | RETRY_WAITING | CircuitBreaker OPEN으로 short-circuit(attemptCount 미증가) |
 | RETRY_WAITING | PROCESSING | `nextAttemptAt` 경과 후 worker가 다시 claim |
 | PROCESSING | FAILED | 발송 실패, `attemptCount >= maxAttempts` |
 | PROCESSING | READY | lease timeout(stuck) 복구, attemptCount 증가 없음 |
@@ -480,10 +482,14 @@ backoff/최대 횟수 로직을 그대로 탄다. 반면 CircuitBreaker가 OPEN�
 - 최대 재시도 횟수: 3회(`notification.retry.max-attempts`)
 - Exponential backoff: 운영 기본값 1분 / 5분 / 15분(`notification.retry.backoff-seconds`)
 - 테스트 프로파일에서는 1초 / 2초 / 3초로 오버라이드해 빠르게 검증한다.
-- 실패할 때마다 `attemptCount`를 증가시키고 `lastFailureReason`을 갱신한다.
-- 매 시도는 `notification_attempt`에 SUCCESS/FAILURE로 이력이 남는다.
+- 실제 발송 실패 시(`sender.send()` 예외)마다 `attemptCount`를 증가시키고 `lastFailureReason`을
+  갱신하며, 매 시도는 `notification_attempt`에 SUCCESS/FAILURE로 이력이 남는다.
 - `attemptCount >= maxAttempts`가 되면 `FAILED`로 전이하고 더 이상 자동 재시도하지 않는다
   (선택 구현인 수동 재시도로만 복구 가능).
+- CircuitBreaker OPEN으로 인한 short-circuit은 발송 시도로 보지 않아 `attemptCount`를
+  소모하지 않는다. 자세한 이유는
+  [CircuitBreaker(resilience4j) 도입 이유와 재시도 정책과의 관계](#circuitbreakerresilience4j-도입-이유와-재시도-정책과의-관계)
+  참고.
 
 ## 예약 발송 (선택 구현)
 
@@ -614,12 +620,15 @@ Docker(Testcontainers)가 필요하다 — 테스트 실행 시 임시 PostgreSQ
 
 ## AI 활용 범위
 
-- AI 코딩 에이전트(Claude Code)를 사용해 초기 프로젝트 구조 설계와 반복적인 보일러플레이트
-  코드(엔티티, 리포지토리, DTO, 설정 파일) 생성을 보조받았다.
-- 최종 설계 판단(기술 스택 선택, 상태 전이 모델, 멱등성 기준, claim 트랜잭션 분리 전략,
-  재시도 정책, stuck 복구 정책, 테스트 케이스 구성)은 직접 검토하고 결정했다.
-- 생성된 코드는 `./gradlew test`로 직접 실행하고, 아래 [검증 결과](#검증-결과) 섹션의
-  시나리오를 통해 검증했다.
+이 프로젝트는 AI 코딩 에이전트(Claude Code)의 도움을 받아 만들었다. 초기 프로젝트
+구조 설계와 반복적인 보일러플레이트 코드(엔티티, 리포지토리, DTO, 설정 파일) 생성은
+AI가 빠르게 초안을 잡아줬지만, PostgreSQL을 선택한 이유, idempotency key를 4개 필드
+조합으로 정한 기준, 상태 전이 모델, claim 트랜잭션 분리 전략, 재시도·CircuitBreaker
+정책, 테스트 케이스 구성 같은 최종 판단은 직접 검토하고 결정했다.
+
+- 생성된 코드를 그대로 두지 않고 `./gradlew test`로 직접 실행했으며, `docker compose up`
+  + `bootRun` 후 curl로 등록/조회/읽음/재시도 흐름을 수동으로도 검증했다(자세한 내용은
+  [검증 결과](#검증-결과) 참고).
 - 그대로 복사한 산출물이 아니라, 요구사항(특히 동시성/장애 복구 시나리오)에 맞게 구조를
   조정하고 검증한 결과물이다.
 
@@ -639,32 +648,24 @@ Docker(Testcontainers)가 필요하다 — 테스트 실행 시 임시 PostgreSQ
 
 ### 직접 확인한 시나리오
 
-1. 동일한 알림 요청을 여러 번(순차 및 동시) 호출해도 `notification` row는 1개만 생성됨.
-2. `READY` 상태 알림은 worker에 의해 `PROCESSING`을 거쳐 `SENT`로 전이됨.
-3. `MockEmailSender`를 실패하도록 설정하면 `RETRY_WAITING` 상태로 전이되고 `attemptCount`가
-   증가하며, `notification_attempt`에 실패 이력이 남음.
-4. 최대 재시도 횟수(3회)를 초과하면 `FAILED` 상태로 전이되고 더 이상 자동 재처리되지 않음.
-5. `PROCESSING` 상태에서 `leaseUntil`이 지난 알림은 `StuckNotificationRecoveryWorker`에
-   의해 다시 `READY`로 복구되며, 이때 `attemptCount`는 증가하지 않음.
-6. 읽음 처리 API(`PATCH /read`)는 여러 번 호출해도 `readAt`이 최초 값으로 유지되고 매번
-   200 OK를 반환함(오류 없음).
-7. `FAILED` 알림에 수동 재시도 API를 호출하면 `attemptCount=0`, `status=READY`로 초기화되고,
-   `FAILED`가 아닌 알림에 호출하면 409 Conflict가 반환됨.
-8. EMAIL/IN_APP/KAKAO_ALIMTALK 채널에 따라 서로 다른 `NotificationSender` 구현체가 호출됨.
-9. 특정 채널에서 연속 발송 실패가 임계치를 넘으면 CircuitBreaker가 OPEN되어, 이후 호출은
-   실제로 `NotificationSender.send()`를 호출하지 않고 즉시 실패 처리(short-circuit)됨.
-   이때는 실제 발송 실패(attemptCount 증가, `notification_attempt` 이력 남음)와 구분되어
-   attemptCount가 증가하지 않고 이력도 남지 않으며, `RETRY_WAITING` + circuit breaker
-   관련 사유만 `lastFailureReason`에 남음.
-10. `scheduledAt`(미래 시각)을 지정해 등록하면 `READY` 상태이지만 그 시각이 지나기 전까지는
-    worker가 claim하지 않고, 시각이 지난 뒤에는 정상적으로 claim되어 `SENT`까지 전이됨.
-    과거 시각으로 등록을 시도하면 `400 Bad Request`.
-11. 여러 스레드(기기 흉내)가 같은 알림에 동시에 읽음 처리 요청을 보내도 `readAt`이 단 하나의
-    값으로만 수렴하고, 예외 없이 모두 200 OK를 반환함(원자적 `COALESCE` UPDATE로 lost update
-    방지).
-12. 여러 worker가 동시에 claim해도 같은 notification id가 두 worker에게 동시에 반환되지
-    않고, claim 결과에 포함된 id는 항상 실제로 DB에서 `PROCESSING`으로 전이된 row와 정확히
-    일치함(`UPDATE ... RETURNING`).
+아래는 실제로 관찰한 핵심 결과이며, 각 시나리오를 검증하는 자동 테스트 목록은
+[주요 테스트 케이스](#주요-테스트-케이스) 표를 참고한다.
+
+1. 동일한 알림 요청을 여러 번(순차·동시) 호출해도 `notification` row는 1개만 생성되고,
+   `READY → PROCESSING → SENT`(성공)로, 실패 시 `RETRY_WAITING`(attemptCount 증가)을
+   거쳐 최대 재시도 초과 시 `FAILED`로 정상 전이됨.
+2. `PROCESSING`에서 `leaseUntil`이 지난 알림은 attemptCount 증가 없이 `READY`로 복구되고,
+   `FAILED` 알림은 수동 재시도로 `attemptCount=0`/`READY`로 초기화됨(FAILED가 아닌 알림에
+   재시도 호출 시 409 Conflict).
+3. 읽음 처리(`PATCH /read`)는 여러 번, 심지어 여러 스레드가 동시에 호출해도 `readAt`이
+   최초 값 하나로만 수렴하고 매번 200 OK를 반환함(원자적 `COALESCE` UPDATE).
+4. EMAIL/IN_APP/KAKAO_ALIMTALK 채널별로 서로 다른 `NotificationSender`가 호출되고,
+   CircuitBreaker가 OPEN되면 실제 호출 없이 short-circuit되며 이때는 attemptCount가
+   증가하지 않고 이력도 남지 않아 실제 발송 실패와 구분됨.
+5. `scheduledAt`(미래 시각) 등록은 그 시각이 지나기 전까지 claim되지 않고, 과거 시각은
+   `400 Bad Request`로 거부됨.
+6. 여러 worker가 동시에 claim해도 같은 id가 중복 반환되지 않고, claim 결과는 항상 실제로
+   `PROCESSING` 전이된 row와 정확히 일치함(`UPDATE ... RETURNING`).
 
 <!-- 아래는 채용 지원자가 실제 로컬 실행 후 직접 채워 넣을 수 있는 자리 -->
 ### 로컬 실행 확인 (선택)
