@@ -23,18 +23,6 @@ class NotificationTest {
     }
 
     @Test
-    void markRead_isIdempotentAndKeepsFirstReadAt() {
-        Notification notification = sample();
-
-        notification.markRead(now);
-        Instant firstReadAt = notification.getReadAt();
-
-        notification.markRead(now.plusSeconds(10));
-
-        assertThat(notification.getReadAt()).isEqualTo(firstReadAt);
-    }
-
-    @Test
     void markSent_transitionsToSentAndClearsProcessingFields() {
         Notification notification = sample();
 
@@ -85,6 +73,36 @@ class NotificationTest {
         assertThat(notification.getNextAttemptAt()).isEqualTo(now.plusSeconds(100));
     }
 
+    @Test
+    void create_withScheduledAt_setsNextAttemptAtToScheduledTimeAndKeepsReadyStatus() {
+        Instant scheduledAt = now.plusSeconds(3600);
+
+        Notification notification = Notification.create(
+                "user-1",
+                NotificationType.ENROLLMENT_COMPLETED,
+                "evt-1",
+                "course-1",
+                NotificationChannel.EMAIL,
+                "title",
+                "message",
+                Map.of(),
+                scheduledAt,
+                3,
+                now);
+
+        assertThat(notification.getStatus()).isEqualTo(NotificationStatus.READY);
+        assertThat(notification.getScheduledAt()).isEqualTo(scheduledAt);
+        assertThat(notification.getNextAttemptAt()).isEqualTo(scheduledAt);
+    }
+
+    @Test
+    void create_withoutScheduledAt_isImmediatelyDue() {
+        Notification notification = sample();
+
+        assertThat(notification.getScheduledAt()).isNull();
+        assertThat(notification.getNextAttemptAt()).isEqualTo(now);
+    }
+
     private Notification sample() {
         return Notification.create(
                 "user-1",
@@ -95,6 +113,7 @@ class NotificationTest {
                 "title",
                 "message",
                 Map.of(),
+                null,
                 3,
                 now);
     }

@@ -7,6 +7,7 @@ import com.example.notification.domain.NotificationType;
 import com.example.notification.domain.RetryPolicy;
 import com.example.notification.infrastructure.persistence.NotificationRepository;
 import java.time.Clock;
+import java.time.Instant;
 import java.util.Map;
 import java.util.Optional;
 import lombok.RequiredArgsConstructor;
@@ -50,6 +51,7 @@ public class NotificationCommandService {
                 rendered.title(),
                 rendered.message(),
                 command.payload(),
+                command.scheduledAt(),
                 retryPolicy.maxAttempts(),
                 clock.instant());
 
@@ -66,6 +68,18 @@ public class NotificationCommandService {
             String eventId,
             String referenceId,
             NotificationChannel channel,
-            Map<String, Object> payload) {
+            Map<String, Object> payload,
+            Instant scheduledAt) {
+
+        /** 예약 발송이 필요 없는(즉시 처리) 등록 요청을 위한 편의 생성자. */
+        public RegisterCommand(
+                String recipientId,
+                NotificationType notificationType,
+                String eventId,
+                String referenceId,
+                NotificationChannel channel,
+                Map<String, Object> payload) {
+            this(recipientId, notificationType, eventId, referenceId, channel, payload, null);
+        }
     }
 }

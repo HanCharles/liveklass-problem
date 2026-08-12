@@ -3,6 +3,7 @@ package com.example.notification.api;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.example.notification.support.AbstractIntegrationTest;
+import java.time.Instant;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -84,6 +85,42 @@ class NotificationControllerApiTest extends AbstractIntegrationTest {
                 "channel", "EMAIL");
 
         ResponseEntity<Map> response = restTemplate.postForEntity("/api/notifications", invalidBody, Map.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void register_withFutureScheduledAt_staysReadyWithScheduledAtEchoedBack() {
+        Instant future = Instant.now().plusSeconds(3600);
+        Map<String, Object> requestBody = Map.of(
+                "recipientId", "user-api-scheduled",
+                "notificationType", "COURSE_START_D1",
+                "eventId", "evt-api-scheduled",
+                "referenceId", "course-1",
+                "channel", "EMAIL",
+                "payload", Map.of("courseTitle", "Spring Boot 입문"),
+                "scheduledAt", future.toString());
+
+        ResponseEntity<Map> response = restTemplate.postForEntity("/api/notifications", requestBody, Map.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        Map<String, Object> data = (Map<String, Object>) response.getBody().get("data");
+        assertThat(data.get("status")).isEqualTo("READY");
+        assertThat(Instant.parse((String) data.get("scheduledAt"))).isEqualTo(future);
+    }
+
+    @Test
+    void register_withPastScheduledAt_returns400() {
+        Instant past = Instant.now().minusSeconds(60);
+        Map<String, Object> requestBody = Map.of(
+                "recipientId", "user-api-scheduled-invalid",
+                "notificationType", "COURSE_START_D1",
+                "eventId", "evt-api-scheduled-invalid",
+                "channel", "EMAIL",
+                "scheduledAt", past.toString());
+
+        ResponseEntity<Map> response = restTemplate.postForEntity("/api/notifications", requestBody, Map.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }

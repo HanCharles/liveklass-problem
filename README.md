@@ -23,6 +23,7 @@ IN_APP 알림을 발송하는 시스템이다. 실제 발송은 API 요청 스�
 - [비동기 처리 구조](#비동기-처리-구조)
 - [상태 전이표](#상태-전이표)
 - [재시도 정책](#재시도-정책)
+- [예약 발송 (선택 구현)](#예약-발송-선택-구현)
 - [중복 발송 방지 전략](#중복-발송-방지-전략)
 - [서버 재시작 후 복구 전략](#서버-재시작-후-복구-전략)
 - [다중 인스턴스 환경 고려](#다중-인스턴스-환경-고려)
@@ -157,6 +158,7 @@ curl -X POST http://localhost:8080/api/notifications \
     "message": "Spring Boot 입문 수강 신청이 완료되었습니다.",
     "attemptCount": 0,
     "maxAttempts": 3,
+    "scheduledAt": null,
     "nextAttemptAt": "2026-08-11T04:30:00Z",
     "lastFailureReason": null,
     "sentAt": null,
@@ -169,6 +171,28 @@ curl -X POST http://localhost:8080/api/notifications \
 
 동일한 `recipientId + notificationType + eventId + channel` 조합으로 다시 요청하면 새 row를
 만들지 않고 기존 알림 정보를 그대로 반환한다(같은 응답, 같은 `notificationId`).
+
+**예약 발송(선택 구현)**: 요청 바디에 미래 시각의 `scheduledAt`(ISO-8601)을 추가하면, 즉시
+처리 대상이 아니라 그 시각 이후에만 worker가 claim하도록 등록된다(과거 시각을 주면 `400
+Bad Request`).
+
+```bash
+curl -X POST http://localhost:8080/api/notifications \
+  -H "Content-Type: application/json" \
+  -d '{
+    "recipientId": "user-1",
+    "notificationType": "COURSE_START_D1",
+    "eventId": "event-2001",
+    "referenceId": "course-1",
+    "channel": "EMAIL",
+    "payload": { "courseTitle": "Spring Boot 입문" },
+    "scheduledAt": "2026-08-20T00:00:00Z"
+  }'
+```
+
+응답의 `status`는 이때도 `READY`이지만(아직 발송 실패가 아니므로), `scheduledAt`/`nextAttemptAt`
+이 요청한 미래 시각으로 채워지고, 그 시각이 지나기 전까지는 worker가 claim하지 않는다.
+자세한 구현 방식은 [예약 발송 (선택 구현)](#예약-발송-선택-구현) 참고.
 
 ### 2. 알림 상태 조회
 
@@ -219,6 +243,15 @@ curl -X PATCH http://localhost:8080/api/notifications/b6f1e6b0-2f7a-4b8e-8c3f-2a
 
 이미 읽은 알림에 다시 호출해도 200 OK를 반환하며, `readAt`은 최초 값을 유지한다(갱신하지 않음).
 
+**여러 기기에서 동시에 읽음 처리 요청이 오면**: 단순히 "먼저 조회 → 메모리에서 값 비교 →
+다시 저장"하는 방식(read-modify-write)으로는 두 기기의 요청이 정말로 동시에 들어올 때
+`readAt`이 나중에 커밋되는 쪽 값으로 덮어써질 수 있다(lost update). 이를 막기 위해
+`UPDATE notification SET read_at = COALESCE(read_at, :now) WHERE id = :id`라는 원자적
+조건부 UPDATE 하나로 처리한다 — `readAt`이 이미 있으면 그 값을 그대로 유지하고, 없을 때만
+새 값을 채운다. PostgreSQL이 이 UPDATE 실행 동안 해당 row에 락을 걸어 동시 요청들을
+직렬화하므로, 몇 개의 기기에서 동시에 호출해도 가장 먼저 커밋된 시각만 최종 `readAt`으로
+남는 것이 보장된다(`NotificationReadConcurrencyTest`에서 20개 스레드로 검증).
+
 ### 5. 수동 재시도 (선택 구현)
 
 ```
@@ -232,6 +265,16 @@ curl -X POST http://localhost:8080/api/notifications/b6f1e6b0-2f7a-4b8e-8c3f-2a6
 FAILED 상태의 알림만 재시도 가능하며, 성공 시 `attemptCount=0`, `status=READY`,
 `nextAttemptAt=now`로 초기화된다. FAILED가 아닌 알림에 호출하면 `409 Conflict`
 (`INVALID_RETRY_STATE`)를 반환한다.
+
+**재시도 횟수 초기화 정책**: 자동 재시도 3회를 모두 소진해 `FAILED`가 된 알림을 수동
+재시도할 때 `attemptCount`를 0으로 **초기화**하는 쪽을 정책으로 택했다. 수동 재시도는
+사람이 "원인(예: 이메일 서버 설정 오류, 수신자 주소 오타 수정 등)을 해결했다"고 판단하고
+누른 액션이므로, 과거 자동 재시도 실패 이력과 무관하게 다시 온전한 3회의 기회를 주는
+것이 합리적이라고 판단했다. 반대로 초기화하지 않는 정책을 택하면 수동 재시도가 단
+1회만 허용되는 셈이 되어(이미 3/3을 소진한 상태이므로), 운영자가 "확실히 고쳤다"고
+확신한 케이스조차 재시도 폭을 주지 못해 수동 개입의 실효성이 떨어진다. 다만
+`notification_attempt` 이력 테이블은 초기화하지 않고 과거 시도 기록을 그대로 보존하므로,
+"몇 번이나 실패했었는지"에 대한 감사(audit) 정보는 손실되지 않는다.
 
 ## 데이터 모델 설명
 
@@ -251,7 +294,8 @@ FAILED 상태의 알림만 재시도 가능하며, 성공 시 `attemptCount=0`, 
 | idempotency_key | `recipientId\|notificationType\|eventId\|channel`, UNIQUE |
 | attempt_count | 누적 실패 횟수(성공 시 증가하지 않음) |
 | max_attempts | 최대 시도 횟수 |
-| next_attempt_at | 다음 재시도(또는 최초 처리) 가능 시각 |
+| scheduled_at | 등록 시 요청한 예약 발송 시각(선택 구현). 즉시 발송 요청이면 null |
+| next_attempt_at | 다음 재시도(또는 최초 처리) 가능 시각. 예약 발송은 등록 시 이 값이 scheduled_at으로 채워짐 |
 | last_failure_reason | 가장 최근 실패 사유 |
 | processing_started_at / lease_until / worker_id | worker claim 및 lease 관리용 |
 | sent_at / read_at | 발송/읽음 시각 |
@@ -417,6 +461,26 @@ CircuitBreaker는 상태 전이 로직을 새로 만들지 않고, "이번 시�
 - `attemptCount >= maxAttempts`가 되면 `FAILED`로 전이하고 더 이상 자동 재시도하지 않는다
   (선택 구현인 수동 재시도로만 복구 가능).
 
+## 예약 발송 (선택 구현)
+
+과제 원문의 "선택 구현" 항목 중 하나인 특정 시각 예약 발송을 구현했다. 새 상태나 별도
+claim 경로를 추가하지 않고, 기존 재시도 폴링 구조를 그대로 재사용하는 방향으로 설계했다.
+
+- 등록 요청에 `scheduledAt`(미래 시각)을 포함하면, 알림은 여전히 `READY` 상태로 저장되지만
+  `next_attempt_at`이 즉시 처리 시(등록 시각)가 아니라 `scheduledAt`으로 채워진다.
+- `NotificationClaimRepository.claim()`의 claim 쿼리를 `status IN ('READY', 'RETRY_WAITING')
+  AND next_attempt_at <= now`로 통일했다(원래는 READY는 무조건, RETRY_WAITING만
+  `next_attempt_at`을 검사했다). 즉시 발송 요청은 등록 시 `next_attempt_at = 등록 시각`으로
+  저장되므로 이 조건이 항상 참이라 기존 동작과 완전히 동일하고, 예약 발송 요청만 그 시각이
+  지나기 전까지 자연스럽게 claim되지 않는다.
+- 원래 요청한 예약 시각은 `scheduled_at` 컬럼에 별도로 보존한다. `next_attempt_at`은 이후
+  재시도가 발생하면 backoff 정책에 따라 계속 갱신되는 운영용 필드라, 재시도가 몇 번
+  일어나고 나면 "원래 언제 예약했었는지"를 잃어버리기 때문이다.
+- 예약 시각이 과거이면 등록 자체를 거부한다(`@Future` 검증, `400 Bad Request`).
+- 새 API 엔드포인트나 새 상태(예: `SCHEDULED`)를 추가하지 않았기 때문에, 클라이언트 입장에서
+  기존 API 계약(`POST /api/notifications`, 상태값 종류)이 전혀 바뀌지 않는다는 것도 이
+  접근의 장점이다.
+
 ## 중복 발송 방지 전략
 
 1. `idempotency_key`(recipientId+notificationType+eventId+channel)에 UNIQUE INDEX.
@@ -471,11 +535,12 @@ Docker(Testcontainers)가 필요하다 — 테스트 실행 시 임시 PostgreSQ
 | `domain/RetryPolicyTest`, `domain/NotificationTest` | 재시도 backoff 계산, 상태 전이 도메인 로직(단위 테스트) |
 | `application/NotificationCommandServiceTest` | 등록 성공, 동일 idempotency key 재요청 시 기존 row 반환, 채널/수신자가 다르면 별도 알림 |
 | `application/NotificationCommandConcurrencyTest` | 20개 스레드 동시 등록 시 row 1개만 생성(동시성) |
-| `application/NotificationProcessorTest` | READY→SENT, 실패 시 RETRY_WAITING(+attemptCount 증가), maxAttempts 초과 시 FAILED, nextAttemptAt 지난 것만 재처리, EMAIL/IN_APP/KAKAO_ALIMTALK 채널 분기, CircuitBreaker OPEN 시 short-circuit |
+| `application/NotificationProcessorTest` | READY→SENT, 실패 시 RETRY_WAITING(+attemptCount 증가), maxAttempts 초과 시 FAILED, nextAttemptAt 지난 것만 재처리, EMAIL/IN_APP/KAKAO_ALIMTALK 채널 분기, CircuitBreaker OPEN 시 short-circuit, 예약 발송 건은 예약 시각 전엔 claim 안 됨/시각 도래 후 claim됨 |
 | `infrastructure/worker/StuckNotificationRecoveryWorkerTest` | lease 만료된 PROCESSING → READY 복구(attemptCount 미증가), lease 유효한 건은 그대로 유지 |
 | `application/NotificationQueryServiceTest` | 목록 조회 필터(읽음/채널), 읽음 처리 반복 호출 안전성 |
+| `application/NotificationReadConcurrencyTest` | 20개 스레드가 동시에 읽음 처리 요청을 보내도 readAt이 단 하나의 값으로만 수렴(lost update 없음) |
 | `application/ManualRetryServiceTest` | FAILED → READY 수동 재시도, FAILED가 아닌 건 재시도 거부 |
-| `api/NotificationControllerApiTest` | HTTP 계층 end-to-end(등록→조회→목록→읽음→재시도 거부), 검증 실패 400, 미존재 404 |
+| `api/NotificationControllerApiTest` | HTTP 계층 end-to-end(등록→조회→목록→읽음→재시도 거부), 검증 실패 400, 미존재 404, 예약 발송 등록/과거 시각 거부 |
 | `infrastructure/worker/SchedulerWiringTest` | `@Scheduled` 배선 자체가 실제로 동작하는지(유일하게 실시간 polling에 의존) |
 
 대부분의 테스트는 `@Scheduled` 타이밍에 의존하지 않고 `NotificationProcessor.processOnce()` /
@@ -490,10 +555,6 @@ Docker(Testcontainers)가 필요하다 — 테스트 실행 시 임시 PostgreSQ
   없다.
 - 실제 메시지 브로커(Kafka/RabbitMQ/SQS)는 사용하지 않았다. 대신 DB 기반 Outbox/Queue로
   구현했으며, 대규모 트래픽 환경에서는 DB polling queue보다 메시지 브로커가 더 적합할 수 있다.
-- **발송 스케줄링(특정 시각 예약 발송)은 구현하지 않았다.** 시간 관계상 우선순위 4번(선택
-  구현 중 가장 낮은 우선순위)이었던 예약 발송은 제외했다. 확장한다면 `notification`에
-  `scheduled_at` 컬럼을 추가하고 claim 쿼리의 조건에 `scheduled_at <= now()`를 포함시키는
-  방식으로 기존 구조를 그대로 재사용할 수 있다.
 - 인증/인가는 과제 허용 범위에 따라 생략했다(`recipientId`를 요청 바디/경로로 직접 전달).
 - 알림 템플릿은 enum 기반 provider(`NotificationTemplateProvider`)로 단순하게 구현했다.
   실제 운영에서는 DB 기반 템플릿 관리 또는 외부 템플릿 엔진으로 교체할 수 있다.
@@ -517,10 +578,10 @@ Docker(Testcontainers)가 필요하다 — 테스트 실행 시 임시 PostgreSQ
 ./gradlew test
 ```
 
-`./gradlew test` 실행 결과 **테스트 클래스 10개, 총 32개 테스트 전부 통과**했다(단위 테스트 9개
-+ Testcontainers 기반 통합/동시성/HTTP/스케줄러 테스트 23개, KAKAO_ALIMTALK 채널 분기와
-CircuitBreaker short-circuit 검증 2건 포함). 상세 리포트는
-`build/reports/tests/test/index.html`에서 확인할 수 있다.
+`./gradlew test` 실행 결과 **테스트 클래스 11개, 총 38개 테스트 전부 통과**했다(단위 테스트
+10개 + Testcontainers 기반 통합/동시성/HTTP/스케줄러 테스트 28개 — KAKAO_ALIMTALK 채널
+분기, CircuitBreaker short-circuit, 예약 발송 claim 지연/도래, 읽음 처리 동시성 20-스레드
+검증 포함). 상세 리포트는 `build/reports/tests/test/index.html`에서 확인할 수 있다.
 
 ### 직접 확인한 시나리오
 
@@ -539,6 +600,12 @@ CircuitBreaker short-circuit 검증 2건 포함). 상세 리포트는
 9. 특정 채널에서 연속 발송 실패가 임계치를 넘으면 CircuitBreaker가 OPEN되어, 이후 호출은
    실제로 `NotificationSender.send()`를 호출하지 않고 즉시 실패 처리(short-circuit)되며,
    이 실패도 기존 재시도 정책(RETRY_WAITING/backoff)을 그대로 따름.
+10. `scheduledAt`(미래 시각)을 지정해 등록하면 `READY` 상태이지만 그 시각이 지나기 전까지는
+    worker가 claim하지 않고, 시각이 지난 뒤에는 정상적으로 claim되어 `SENT`까지 전이됨.
+    과거 시각으로 등록을 시도하면 `400 Bad Request`.
+11. 여러 스레드(기기 흉내)가 같은 알림에 동시에 읽음 처리 요청을 보내도 `readAt`이 단 하나의
+    값으로만 수렴하고, 예외 없이 모두 200 OK를 반환함(원자적 `COALESCE` UPDATE로 lost update
+    방지).
 
 <!-- 아래는 채용 지원자가 실제 로컬 실행 후 직접 채워 넣을 수 있는 자리 -->
 ### 로컬 실행 확인 (선택)

@@ -7,9 +7,12 @@ import com.example.notification.domain.Notification;
 import com.example.notification.domain.NotificationAttempt;
 import com.example.notification.domain.NotificationChannel;
 import com.example.notification.domain.NotificationStatus;
+import com.example.notification.domain.NotificationType;
 import com.example.notification.support.AbstractIntegrationTest;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 class NotificationProcessorTest extends AbstractIntegrationTest {
@@ -151,5 +154,48 @@ class NotificationProcessorTest extends AbstractIntegrationTest {
                         && n.getLastFailureReason().toLowerCase().contains("circuitbreaker"))
                 .count();
         assertThat(circuitBreakerRejectedCount).isEqualTo(2);
+    }
+
+    @Test
+    void processOnce_doesNotClaimNotificationScheduledForTheFuture() {
+        Instant future = clock.instant().plusSeconds(3600);
+        Notification scheduled = notificationCommandService.register(new NotificationCommandService.RegisterCommand(
+                "user-1",
+                NotificationType.ENROLLMENT_COMPLETED,
+                "evt-scheduled",
+                "course-1",
+                NotificationChannel.EMAIL,
+                Map.of("courseTitle", "Spring Boot 입문"),
+                future));
+
+        int processed = notificationProcessor.processOnce();
+
+        assertThat(processed).isZero();
+        Notification reloaded =
+                notificationRepository.findById(scheduled.getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(NotificationStatus.READY);
+        assertThat(reloaded.getScheduledAt()).isEqualTo(future);
+    }
+
+    @Test
+    void processOnce_claimsScheduledNotificationOnceItsTimeHasPassed() {
+        Instant future = clock.instant().plusSeconds(3600);
+        Notification scheduled = notificationCommandService.register(new NotificationCommandService.RegisterCommand(
+                "user-1",
+                NotificationType.ENROLLMENT_COMPLETED,
+                "evt-scheduled-due",
+                "course-1",
+                NotificationChannel.EMAIL,
+                Map.of("courseTitle", "Spring Boot 입문"),
+                future));
+        // 실제 예약 시각까지 기다리는 대신, 이미 그 시각이 지난 것처럼 강제로 되돌려 결정적으로 검증한다.
+        forceNextAttemptAt(scheduled.getId(), clock.instant().minusSeconds(1));
+
+        notificationProcessor.processOnce();
+
+        Notification reloaded =
+                notificationRepository.findById(scheduled.getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(NotificationStatus.SENT);
+        assertThat(reloaded.getScheduledAt()).isEqualTo(future);
     }
 }

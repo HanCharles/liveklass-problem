@@ -74,6 +74,14 @@ public class Notification {
     @Column(name = "max_attempts", nullable = false)
     private int maxAttempts;
 
+    /**
+     * 등록 시 요청한 "발송 예약 시각"(선택 구현). {@code nextAttemptAt}은 재시도 때마다
+     * 계속 갱신되는 운영용 필드라 원래 요청한 예약 시각을 잃어버리므로, 감사/조회 목적으로
+     * 원본 요청값을 별도로 보존한다. 즉시 발송 요청이면 null이다.
+     */
+    @Column(name = "scheduled_at")
+    private Instant scheduledAt;
+
     @Column(name = "next_attempt_at")
     private Instant nextAttemptAt;
 
@@ -101,6 +109,12 @@ public class Notification {
     @Column(name = "updated_at", nullable = false)
     private Instant updatedAt;
 
+    /**
+     * @param scheduledAt 특정 시각 예약 발송을 원하면 그 시각, 즉시 처리 대상이면 null.
+     *                    null이 아니면 status는 READY로 저장하되 {@code nextAttemptAt}을
+     *                    이 시각으로 설정해 그 전까지는 worker가 claim하지 않게 한다
+     *                    (claim 쿼리가 READY도 {@code next_attempt_at <= now} 조건을 검사함).
+     */
     public static Notification create(
             String recipientId,
             NotificationType notificationType,
@@ -110,6 +124,7 @@ public class Notification {
             String title,
             String message,
             Map<String, Object> payload,
+            Instant scheduledAt,
             int maxAttempts,
             Instant now) {
         Notification notification = new Notification();
@@ -126,7 +141,8 @@ public class Notification {
         notification.idempotencyKey = buildIdempotencyKey(recipientId, notificationType, eventId, channel);
         notification.attemptCount = 0;
         notification.maxAttempts = maxAttempts;
-        notification.nextAttemptAt = now;
+        notification.scheduledAt = scheduledAt;
+        notification.nextAttemptAt = scheduledAt != null ? scheduledAt : now;
         notification.createdAt = now;
         notification.updatedAt = now;
         return notification;
@@ -135,14 +151,6 @@ public class Notification {
     public static String buildIdempotencyKey(
             String recipientId, NotificationType type, String eventId, NotificationChannel channel) {
         return recipientId + "|" + type + "|" + eventId + "|" + channel;
-    }
-
-    /** 이미 읽은 알림을 다시 읽음 처리해도 안전하도록 readAt이 있으면 갱신하지 않는다(멱등). */
-    public void markRead(Instant now) {
-        if (this.readAt == null) {
-            this.readAt = now;
-            this.updatedAt = now;
-        }
     }
 
     public void markSent(Instant now) {

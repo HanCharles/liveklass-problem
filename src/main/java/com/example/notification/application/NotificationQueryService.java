@@ -32,11 +32,17 @@ public class NotificationQueryService {
         return notificationRepository.search(recipientId, read, channel, status, pageable);
     }
 
-    /** 이미 읽은 알림을 다시 읽음 처리해도 성공해야 하는 멱등 API. 여러 기기에서 동시에 호출되어도 readAt은 최초 1회만 반영된다. */
+    /**
+     * 이미 읽은 알림을 다시 읽음 처리해도 성공해야 하는 멱등 API.
+     *
+     * {@code readAt}이 없을 때만 세팅하는 조건부 UPDATE(SQL {@code COALESCE})를 하나의
+     * 원자적 문장으로 실행하므로, 여러 기기에서 정말로 동시에 요청이 들어와도(단순 낙관적
+     * read-modify-write가 아니라 DB row lock으로 직렬화됨) 가장 먼저 커밋된 시각만 최종
+     * readAt으로 남는다(lost update 불가능).
+     */
     @Transactional
     public Notification markRead(UUID id) {
-        Notification notification = getById(id);
-        notification.markRead(clock.instant());
-        return notification;
+        notificationRepository.markReadIfUnread(id, clock.instant());
+        return getById(id);
     }
 }
