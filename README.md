@@ -1,5 +1,7 @@
 # 알림 발송 시스템 (과제 C)
 
+- Repository: https://github.com/HanCharles/liveklass-problem
+
 수강 신청 완료, 결제 확정, 강의 시작 D-1, 취소 처리 등 이벤트 발생 시 사용자에게 EMAIL 또는
 IN_APP 알림을 발송하는 시스템이다. 실제 발송은 API 요청 스레드와 분리된 비동기 worker가
 처리하며, 실패 시 재시도하고, 동일 이벤트에 대한 중복 발송을 방지하며, 서버 재시작 및 worker
@@ -69,6 +71,10 @@ IN_APP 알림을 발송하는 시스템이다. 실제 발송은 API 요청 스�
 ### 로컬 실행
 
 ```bash
+# 0. 클론
+git clone https://github.com/HanCharles/liveklass-problem.git
+cd liveklass-problem
+
 # 1. PostgreSQL 기동
 docker compose up -d
 
